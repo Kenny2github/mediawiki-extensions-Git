@@ -1,0 +1,14 @@
+{
+	"name": "Git",
+	"author": [
+		"Kenny2scratch"
+	],
+	"url": "https://github.com/Kenny2github/mediawiki-extension-Git",
+	"description": "Edit and browse MediaWiki wikis through Git.",
+	"license-name": "GPLv3",
+	"type": "api",
+	"AutoloadNamespaces": {
+		"MediaWiki\\Extension\\Git\\": "includes"
+	},
+	"manifest_version": 2
+}
