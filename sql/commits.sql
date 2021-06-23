@@ -1,4 +1,4 @@
-CREATE TABLE /*_*/git_commits (
+CREATE TABLE IF NOT EXISTS /*_*/git_commits (
   -- git commit hash - 40 hexits for sha1
   sha1 char(40) binary PRIMARY KEY,
   -- tree hash

@@ -1,4 +1,4 @@
-CREATE TABLE /*_*/git_revisions (
+CREATE TABLE IF NOT EXISTS /*_*/git_revisions (
   -- revision ID
   rev_id integer unsigned,
   -- git commit hash
