@@ -4,6 +4,9 @@ namespace MediaWiki\Extension\Git;
 use Wikimedia\Rdbms\IDatabase;
 use Wikimedia\Rdbms\IResultWrapper;
 use DatabaseUpdater;
+use MediaWiki\MediaWikiServices;
+use Title;
+use NamespaceInfo;
 
 class CommitGenerator {
 	public static function generateCommits(
@@ -11,41 +14,45 @@ class CommitGenerator {
 		bool $purge = false,
 		?DatabaseUpdater $updater = null
 	) {
-		// Every commit depends on the previous
-		// Find out which revisions already have commits associated with them
-		// Generate, starting with least recent commit-less revision
-
-		$result = self::revisionsNeedingCommits( $dbw, $purge );
+		// Collate an array of arrays of revision IDs.
+		// All revisions in each sub-array probably came from the same commit.
+		// This also handles starting from scratch if $purge is true.
+		$revidss = self::revisionIDsNeedingCommits( $dbw, $purge );
+		// No revisions to work on, our job here is done
+		if ( $revidss === false ) return;
 
 		// Get most recent commit hash, to use as the parent of the
 		// first new commit being generated.
-		$root_parent = self::getParent( $dbw );
+		$commitHash = self::getParent( $dbw );
 
-		$revidss = self::collateRevisionIDs( $result );
+		$services = MediaWikiServices::getInstance();
+		$store = $services->getRevisionStore();
+		$nsInfo = $services->getNamespaceInfo();
 
-		$select_ids = self::tailRevisionIDs( $revidss );
-
-		$result = self::collatedRevisions( $dbw, $select_ids );
-
-		$revids = reset( $revidss );
-		while ( ($row = $result->fetchObject()) !== false ) {
-			if ( $updater ) {
-				$msg = '...committing revision';
-				if ( count( $revids ) > 1 ) {
-					$msg .= 's ' . implode( ', ', $revids );
-				} else {
-					$msg .= ' ' . $revids[0];
-				}
-				$updater->output( $msg );
-			}
-			self::generateCommit();
-			$revids = next( $revidss );
+		$roles = self::getSlotRoleIDs( $dbw ); // [Slot Name => Slot ID]
+		$tree = self::getBlobs( $dbw ); // [Page ID => [Slot ID => Blob Hash]]
+		foreach ( $revidss as $revids ) {
+			// From this set of revision IDs (which, remember, we are treating
+			// as having come from one commit), get a mapping of
+			// [Page ID => Most recent revision to this page in this set]
+			$pages = self::latestRevisions( $revids, $store );
+			// Update $tree with blob-hashes of the contents of the above revisions
+			self::updateTree( $tree, $pages, $roles );
+			// Now that the blobs are hashed, work our way up the hierarchy.
+			// Hash the slots of a page as one tree, then pages in a namespace.
+			// Finally, hash the root tree of namespaces and return that hash.
+			$treeHash = self::hashTree( $tree, $roles, $nsInfo );
+			// Author and comment information comes from the last revision in the set.
+			$rev = $store->getRevisionById( $revids[array_key_last( $revids )] );
+			// Generate the commit hash and insert commit data into the DB.
+			// This hash is the parent of the next commit.
+			$commitHash = self::hashCommit( $treeHash, $commitHash, $rev );
 		}
-		// TODO: probably might have to end up maintaining some sort of working tree
-		// this may be more complicated than I thought
+		// Bring the blob tree up to date in the DB for future generations.
+		self::updateBlobs( $dbw, $tree );
 	}
 
-	private static function revisionsNeedingCommits( IDatabase $dbw, bool $purge ) {
+	private static function revisionIDsNeedingCommits( IDatabase $dbw, bool $purge ) {
 		$tables = [
 			'r' => 'revision',
 			'c' => 'comment',
@@ -69,6 +76,7 @@ class CommitGenerator {
 			// because purge means we re-generate them all.
 			$dbw->delete( 'git_commits', IDatabase::ALL_ROWS, __METHOD__ );
 			$dbw->delete( 'git_revisions', IDatabase::ALL_ROWS, __METHOD__ );
+			$dbw->delete( 'git_blobs', IDatabase::ALL_ROWS, __METHOD__ );
 			// All revisions now need commits
 			$result = $dbw->select(
 				$tables, $columns,
@@ -86,7 +94,7 @@ class CommitGenerator {
 			);
 			if ( $result === false ) {
 				// All revisions have commits attached, so we're done here
-				return;
+				return false;
 			}
 			// Even if some subsequent revisions have commits associated,
 			// each commit depends on the previous, so those commits have
@@ -108,7 +116,7 @@ class CommitGenerator {
 				$m, $opts, $join
 			);
 		}
-		return $result;
+		return self::collateRevisionIDs( $result );
 	}
 
 	private static function getParent( IDatabase $dbw ) {
@@ -140,40 +148,150 @@ class CommitGenerator {
 		return $revids;
 	}
 
-	private static function tailRevisionIDs( array $revids ) {
-		$result = [];
-		foreach ( $revids as $ids ) {
-			// Tree is counted at end of sequence of like revisions
-			$result[] = $ids[array_key_last( $ids )];
+	private static function getSlotRoleIDs( IDatabase $dbw ) {
+		$map = [];
+		$result = $dbw->select( 'slot_roles', '*' );
+		while ( ($row = $result->fetchObject()) !== false ) {
+			$map[$row->role_name] = $row->role_id;
 		}
-		return $result;
+		return $map;
 	}
 
-	private static function collatedRevisions( IDatabase $dbw, array $revids ) {
-		$tables = [
-			'r' => 'revision',
-			'c' => 'comment',
-			'a' => 'actor',
-			'ct' => 'revision_comment_temp',
-			'at' => 'revision_actor_temp'
-		];
-		$columns = [
-			'rev_id' => 'r.rev_id',
-			'comment' => 'c.comment_text',
-			'actor' => 'a.actor_name'
-		];
-		$m = __METHOD__;
-		$conds = ['r.rev_id' => $revids ];
-		$opts = ['ORDER BY' => 'rev_id'];
-		$join = [
-			'ct' => ['LEFT JOIN', 'r.rev_id=ct.revcomment_rev'],
-			'c' => ['LEFT JOIN', 'ct.revcomment_comment_id=c.comment_id'],
-			'at' => ['LEFT JOIN', 'r.rev_id=at.revactor_rev'],
-			'a' => ['LEFT JOIN', 'at.revactor_actor=a.actor_id']
-		];
-		return $dbw->select(
-			$tables, $columns,
-			$conds, $m, $opts, $join
+	private static function latestRevisions( array $revids, $store ) {
+		$revs = array_map( $store->getRevisionById, $revids );
+		$pages = [];
+		foreach ( $revs as $rev ) {
+			$pageid = $rev->getPageId();
+			$pages[$pageid] = $rev;
+		}
+		return $pages;
+	}
+
+	private static function hashObject( string $type, string $text, bool $raw = true ) {
+		return sha1( $type . ' ' . strlen( $text ) . "\0" . $text, $raw );
+	}
+
+	private static function updateTree( array $tree, array $pages, array $roles ) {
+		foreach ( $pages as $pageid => $rev ) {
+			$slots = $rev->getSlots()->getSlots();
+			$tree[$pageid] = [];
+			foreach ( $slots as $name => $content ) {
+				$text = $content->serialize();
+				$hash = self::hashObject( 'blob', $text );
+				$tree[$pageid][$roles[$name]] = $hash;
+			}
+		}
+	}
+
+	private static function hashTree( array $tree, array $roles, NamespaceInfo $nsInfo ) {
+		// Hash each collection of slot blobs as a tree
+		$slotTree = []; // [Page ID => Slot Tree Hash]
+		foreach ( $tree as $pageid => $slots ) {
+			// slot names present in this tree
+			$pageroles = array_keys( array_intersect( $roles, array_keys( $slots ) ) );
+			sort( $pageroles );
+			$text = '';
+			foreach ( $pageroles as $role ) {
+				$text .= '100644 ' . $role . "\0";
+				$text .= $slots[$roles[$role]]; // blob hash
+			}
+			$hash = self::hashObject( 'tree', $text );
+			$slotTree[$pageid] = $hash;
+		}
+		// Group pages by namespace
+		$namespace = []; // [Namespace Number => [Page ID => Page Title]]
+		foreach ( array_keys( $slotTree ) as $pageid ) {
+			$title = Title::newFromID( $pageid );
+			$ns = $title->getNamespace();
+			if ( !isset( $namespace[$ns] ) ) $namespace[$ns] = [];
+			$namespace[$ns][$pageid] = $title->getDBkey();
+		}
+		// Hash each namespace of page trees as a tree
+		$nsTree = []; // [Namespace Number => Page Tree Hash]
+		foreach ( $namespace as $ns => $pages ) {
+			$ids = array_flip( $pages );
+			$titles = array_values( $pages );
+			sort( $titles );
+			$text = '';
+			foreach ( $titles as $title ) {
+				$text .= '040000 ' . $title . "\0";
+				$text .= $slotTree[$ids[$title]]; // tree hash
+			}
+			$hash = self::hashObject( 'tree', $text );
+			$nsTree[$ns] = $hash;
+		}
+		// Hash the root collection of namespace trees as the final tree
+		$namespace = array_flip( $nsInfo->getCanonicalNamespaces() );
+		$names = array_keys( $namespace );
+		sort( $names );
+		$text = '';
+		foreach ( $names as $name ) {
+			$text .= '040000 ' . $name . "\0";
+			$text .= $nsTree[$namespace[$name]];
+		}
+		return self::hashObject( 'tree', $text, false );
+	}
+
+	private static function hashCommit(
+		IDatabase $dbw, string $treeHash,
+		?string $parentHash, $rev
+	) {
+		global $wgNoReplyAddress, $wgSitename, $wgLocalTZoffset;
+		$actor = $rev->getUser( $rev::RAW );
+		$timestamp = wfTimestamp( TS_UNIX, $rev->getTimestamp() );
+		$timestamp .= sprintf( ' %+03d%02d', $wgLocalTZoffset / 60, $wgLocalTZoffset % 60 );
+		$author = $actor->getName() . '<' . $wgNoReplyAddress . '> ' . $timestamp;
+		$committer = $wgSitename . '<' . $wgNoReplyAddress . '> ' . $timestamp;
+		$comment = $rev->getComment( $rev::RAW )->$text;
+
+		$text = '';
+		$text .= 'tree ' . $treeHash . "\n";
+		if ( $parentHash ) $text .= 'parent ' . $parentHash . "\n";
+		$text .= 'author ' . $author . "\n";
+		$text .= 'committer ' . $committer . "\n";
+		$text .= "\n" . $comment . "\n";
+		$hash = self::hashObject( 'commit', $text, false );
+		$dbw->insert(
+			'git_commits',
+			[
+				'sha1' => $hash,
+				'tree' => $treeHash,
+				'parents' => $parentHash ?? '',
+				'author' => $author,
+				'committer' => $committer,
+				'comment' => $comment
+			],
+			__METHOD__
+		);
+		return $hash;
+	}
+
+	private static function getBlobs( IDatabase $dbw ) {
+		$tree = [];
+		$result = $dbw->select(
+			'git_blobs',
+			['page_id', 'role_id', 'sha1'],
+			[], __METHOD__
+		);
+		while ( ($row = $result->fetchObject()) !== false ) {
+			if ( !isset( $tree[$row->page_id] ) ) $tree[$row->page_id] = [];
+			$tree[$row->page_id][$row->role_id] = $row->sha1;
+		}
+		return $tree;
+	}
+
+	private static function updateBlobs( IDatabase $dbw, array $tree ) {
+		$rows = [];
+		foreach ( $tree as $pageid => $slots ) {
+			foreach ( $slots as $slot => $hash ) {
+				$rows[] = ['page_id' => $page, 'role_id' => $slot, 'sha1' => $hash];
+			}
+		}
+		$dbw->replace(
+			'git_blobs',
+			['page_id', 'role_id'],
+			$rows,
+			__METHOD__
 		);
 	}
 }
