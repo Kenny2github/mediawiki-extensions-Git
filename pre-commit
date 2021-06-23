@@ -1,0 +1,17 @@
+#!/usr/bin/env php
+<?php
+// MediaWiki strips newlines off the end of page content.
+// Without this, commits translated into edits on the remote
+// can be different from the ones made locally, which will
+// require the local repo to rebase force pull every time.
+// Put this file into .git/hooks
+
+$find = trim( `find . -type f | grep -v "\.git"` );
+foreach ( explode( "\n", $find ) as $file ) {
+	$content = file_get_contents( $file );
+	$stripped = rtrim( $content, "\n" );
+	if ( $content !== $stripped ) {
+		file_put_contents( $file, $stripped );
+		passthru( "git add '$file'" );
+	}
+}
